@@ -1,0 +1,169 @@
+#pragma once
+#include <Arduino.h>
+
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<title>BLE Seismometer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: Arial, sans-serif; background-color: #121212; color: #e0e0e0; text-align: center; margin: 0; padding: 10px; }
+  h1 { color: #e0e0e0; }
+  .container { max-width: 800px; margin: auto; padding: 20px; background-color: #1e1e1e; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.5); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-top: 20px; }
+  .card { background-color: #2c2c2c; padding: 20px; border-radius: 8px; }
+  .card h2 { margin-top: 0; color: #e0e0e0; font-size: 1.2em; }
+  .mercalli-peak { font-size: 4em; color: #cf6679; font-weight: bold; }
+  .mercalli-now { font-size: 2em; color: #e0e0e0; }
+  .peak-values p, .current-values p { margin: 5px 0; font-size: 1.1em; }
+  .peak-values span, .current-values span { font-weight: bold; color: #f2f2f2; }
+  button { background-color: #bb86fc; color: #121212; border: none; padding: 15px 30px; font-size: 1em; border-radius: 5px; cursor: pointer; margin-top: 20px; width: 90%; }
+  button:hover { background-color: #3700b3; color: #ffffff; }
+  button:disabled { background-color: #444; color: #888; cursor: not-allowed; }
+  .footer { margin-top: 20px; font-size: 0.8em; color: #888; }
+  #status { margin-top: 15px; font-weight: bold; color: #f2f2f2; }
+</style>
+</head>
+<body>
+  <div class="container">
+    <h1>Mercalli Seismometer</h1>
+    <p id="status">Disconnected</p>
+    <button id="connectButton">Connect to Seismometer</button>
+    <button id="resetButton" disabled>Reset Peak Values</button>
+    
+    <div class="grid">
+      <div class="card mercalli">
+        <h2>PEAK MERCALLI</h2>
+        <p class="mercalli-peak" id="mercalli-peak">0</p>
+      </div>
+      <div class="card mercalli">
+        <h2>CURRENT MERCALLI</h2>
+        <p class="mercalli-now" id="mercalli-now">0</p>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card peak-values">
+        <h2>Peak Deviations (m/s<sup>2</sup>)</h2>
+        <p>X: <span id="x-peak">0.000</span></p>
+        <p>Y: <span id="y-peak">0.000</span></p>
+        <p>Z: <span id="z-peak">0.000</span></p>
+        <p>Mag: <span id="dev-mag-peak">0.000</span></p>
+      </div>
+      <div class="card current-values">
+        <h2>Current Deviations (m/s<sup>2</sup>)</h2>
+        <p>X: <span id="x-now">0.000</span></p>
+        <p>Y: <span id="y-now">0.000</span></p>
+        <p>Z: <span id="z-now">0.000</span></p>
+        <p>Mag: <span id="dev-mag-now">0.000</span></p>
+      </div>
+    </div>
+    <div class="footer">
+      <p>(c) 2025 John Schop</p>
+    </div>
+  </div>
+
+<script>
+  const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+  const DATA_CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+  const RESET_CHARACTERISTIC_UUID = "ec0e0001-36e1-4688-b7f5-ea07361b26a8";
+
+  let bleDevice;
+  let resetCharacteristic;
+  const connectButton = document.getElementById('connectButton');
+  const resetButton = document.getElementById('resetButton');
+  const statusDisplay = document.getElementById('status');
+
+  connectButton.addEventListener('click', connectToDevice);
+  resetButton.addEventListener('click', resetPeaks);
+
+  function connectToDevice() {
+    if (!navigator.bluetooth) {
+      alert('Web Bluetooth API is not available in this browser. Please use Chrome on Android, Mac, or Windows.');
+      return;
+    }
+    
+    statusDisplay.innerText = 'Scanning...';
+    navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+      optionalServices: [SERVICE_UUID]
+    })
+    .then(device => {
+      statusDisplay.innerText = 'Connecting...';
+      bleDevice = device;
+      bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+      return device.gatt.connect();
+    })
+    .then(server => {
+      statusDisplay.innerText = 'Getting Service...';
+      return server.getPrimaryService(SERVICE_UUID);
+    })
+    .then(service => {
+      statusDisplay.innerText = 'Getting Characteristics...';
+      return Promise.all([
+        service.getCharacteristic(DATA_CHARACTERISTIC_UUID),
+        service.getCharacteristic(RESET_CHARACTERISTIC_UUID)
+      ]);
+    })
+    .then(characteristics => {
+      const dataCharacteristic = characteristics[0];
+      resetCharacteristic = characteristics[1];
+      
+      statusDisplay.innerText = 'Subscribing to Data...';
+      dataCharacteristic.startNotifications();
+      dataCharacteristic.addEventListener('characteristicvaluechanged', handleData);
+      
+      statusDisplay.innerText = 'Connected';
+      connectButton.disabled = true;
+      resetButton.disabled = false;
+    })
+    .catch(error => {
+      statusDisplay.innerText = `Error: ${error.name}`;
+      console.error(error);
+    });
+  }
+
+  function onDisconnected() {
+    statusDisplay.innerText = 'Disconnected';
+    connectButton.disabled = false;
+    resetButton.disabled = true;
+    bleDevice = null;
+    resetCharacteristic = null;
+  }
+
+  function handleData(event) {
+    const value = event.target.value;
+    const decoder = new TextDecoder('utf-8');
+    const jsonString = decoder.decode(value);
+    const data = JSON.parse(jsonString);
+
+    document.getElementById('mercalli-peak').innerText = data.mercalli_peak;
+    document.getElementById('mercalli-now').innerText = data.mercalli_now;
+    document.getElementById('x-peak').innerText = data.x_peak.toFixed(3);
+    document.getElementById('y-peak').innerText = data.y_peak.toFixed(3);
+    document.getElementById('z-peak').innerText = data.z_peak.toFixed(3);
+    document.getElementById('dev-mag-peak').innerText = data.dev_mag_peak.toFixed(3);
+    document.getElementById('x-now').innerText = data.x_now.toFixed(3);
+    document.getElementById('y-now').innerText = data.y_now.toFixed(3);
+    document.getElementById('z-now').innerText = data.z_now.toFixed(3);
+    document.getElementById('dev-mag-now').innerText = data.dev_mag_now.toFixed(3);
+  }
+
+  function resetPeaks() {
+    if (!resetCharacteristic) {
+      return;
+    }
+    // Write a single byte to trigger the reset
+    const buffer = new Uint8Array([1]);
+    resetCharacteristic.writeValue(buffer)
+      .then(() => {
+        console.log('Reset command sent.');
+      })
+      .catch(error => {
+        console.error('Error sending reset command:', error);
+      });
+  }
+</script>
+</body>
+</html>
+)rawliteral";
