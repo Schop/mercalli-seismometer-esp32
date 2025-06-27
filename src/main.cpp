@@ -239,7 +239,7 @@ void setup() {
   resetPeakValues();
   
   
-  Serial.println(F("Seismometer initialized successfully!"));
+  Serial.println(F("Seismometer initialized successfully."));
   Serial.println(F("Available serial commands: STATUS, RESET, CALIBRATE, SSID <name>, PASS <password>, BOOT"));
   Serial.println(F("Press button on GPIO 4 to reset peak values."));
 }
@@ -410,7 +410,7 @@ void resetPeakValues() {
   deviation_magnitude_peak = 0;
   mercalli_peak = 0;
   sample_count = 0; // Reset baseline establishment
-  Serial.println("Peak values and baseline reset!");
+  Serial.println("Peak values and baseline reset.");
   
   // Show reset confirmation on display briefly
   display.clearDisplay();
@@ -528,10 +528,10 @@ void checkForSerialCommand() {
     if (reading != buttonState) {
       buttonState = reading;
       if (buttonState == LOW) {
-        Serial.println("Button press registered. Resetting values.");
+        Serial.println("Button was pressed. Resetting values.");
         resetPeakValues();
       } else { // buttonState is HIGH
-        Serial.println("Button released.");
+        Serial.println("Button was released.");
       }
     }
   }
@@ -541,7 +541,7 @@ void checkForSerialCommand() {
 
 void calibrateAccelerometer() {
   Serial.println("Starting accelerometer calibration...");
-  Serial.println("Keep the device STILL during calibration!");
+  Serial.println("Keep the device still during calibration.");
   
   // Display calibration message
   display.clearDisplay();
@@ -658,7 +658,7 @@ void calibrateAccelerometer() {
     calibration_offset_z = -avgZ;
     calibrated = true;
     
-    Serial.println("Software calibration complete!");
+    Serial.println("Software calibration complete.");
     Serial.print("Raw averages - X: "); Serial.print(avgX, 3);
     Serial.print(" Y: "); Serial.print(avgY, 3);
     Serial.print(" Z: "); Serial.println(avgZ, 3);
@@ -722,20 +722,20 @@ void calibrateAccelerometer() {
       display.setCursor(0, 50);
       display.print(NOISE_LABEL);
       display.print(noise_threshold, 3);
-      Serial.println("Software calibration successful!");
+      Serial.println("Software calibration successful.");
     } else {
       display.setCursor(0, 20);
       display.println(WARNING_MESSAGE);
       display.setCursor(0, 35);
       display.println(CALIBRATION_ISSUE);
-      Serial.println("Software calibration may have issues");
+      Serial.println("Software calibration may have issues.");
     }
 
     display.display();
     delay(3000);
     
   } else {
-    Serial.println("Calibration failed - no valid samples!");
+    Serial.println("Calibration failed - no valid samples.");
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
