@@ -808,10 +808,10 @@ void setupWifi() {
     
     // Start Access Point
     WiFi.mode(WIFI_AP);
-    String apName = "Seismometer-" + String(WiFi.macAddress().substring(9, 17));
+    String apName = "Seismometer";
     apName.replace(":", "");
     
-    if (WiFi.softAP(apName.c_str(), "seismo123")) {
+    if (WiFi.softAP(apName.c_str())) {
       Serial.println(F("Access Point started"));
       Serial.print(F("AP Name: "));
       Serial.println(apName);
