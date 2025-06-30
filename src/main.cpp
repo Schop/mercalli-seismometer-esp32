@@ -13,9 +13,9 @@
 #include "ble_viewer.h"
 #include "wifi_viewer.h"
 
-// WiFi credentials - Can be updated via Serial
-String ssid = "Odido-16EBE7";
-String password = "WHJYVE7LUUSV37YL";
+// WiFi credentials - Can be updated via Serial or Access Point
+String ssid = "YOUR_SSID_HERE"; // Set your WiFi SSID here
+String password = "YOUR_PASSWORD_HERE"; // Set your WiFi password here
 
 // EEPROM settings for WiFi credentials
 #define EEPROM_SIZE 128
