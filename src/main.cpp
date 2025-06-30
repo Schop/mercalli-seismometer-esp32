@@ -131,6 +131,8 @@ void handleRoot();
 void handleData();
 void handleReset();
 void handleBleViewer();
+void handleWifiConfig();
+void handleWifiSave();
 String getSensorDataJson();
 void saveWifiCredentials();
 void loadWifiCredentials();
@@ -219,12 +221,14 @@ void setup() {
   // Setup WiFi and display IP
   setupWifi();
   
-  // Start web server if WiFi is connected
-  if (WiFi.status() == WL_CONNECTED) {
+  // Start web server if WiFi is connected OR in AP mode
+  if (WiFi.status() == WL_CONNECTED || WiFi.getMode() == WIFI_AP) {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/data", HTTP_GET, handleData);
     server.on("/reset", HTTP_POST, handleReset);
-    server.on("/ble", HTTP_GET, handleBleViewer); // <-- ADD THIS
+    server.on("/ble", HTTP_GET, handleBleViewer);
+    server.on("/config", HTTP_GET, handleWifiConfig);
+    server.on("/save", HTTP_POST, handleWifiSave);
     server.begin();
     Serial.println("Web server started");
   }
@@ -242,11 +246,16 @@ void setup() {
   Serial.println(F("Seismometer initialized successfully."));
   Serial.println(F("Available serial commands: STATUS, RESET, CALIBRATE, SSID <name>, PASS <password>, BOOT"));
   Serial.println(F("Press button on GPIO 4 to reset peak values."));
+  
+  if (WiFi.getMode() == WIFI_AP) {
+    Serial.println(F("*** Access Point Mode Active ***"));
+    Serial.println(F("Connect to the AP and go to http://192.168.4.1 to configure WiFi"));
+  }
 }
 
 void loop() {
   // Handle web server requests
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED || WiFi.getMode() == WIFI_AP) {
     server.handleClient();
   }
 
@@ -454,6 +463,14 @@ void checkForSerialCommand() {
         Serial.println(ssid);
         Serial.print(F("  IP Address: "));
         Serial.println(WiFi.localIP());
+      } else if (WiFi.getMode() == WIFI_AP) {
+        Serial.println(F("Access Point Mode"));
+        Serial.print(F("  AP Name: Seismometer-"));
+        String mac = WiFi.macAddress();
+        mac.replace(":", "");
+        Serial.println(mac.substring(6));
+        Serial.print(F("  AP IP: "));
+        Serial.println(WiFi.softAPIP());
       } else {
         Serial.println(F("Offline"));
         Serial.print(F("  Configured SSID: "));
@@ -786,9 +803,39 @@ void setupWifi() {
     Serial.println(F("Connected to WiFi"));
     Serial.print(F("IP Address: "));
     Serial.println(WiFi.localIP());
-
   } else {
-    Serial.println(F("Failed to connect to WiFi. Continuing offline."));
+    Serial.println(F("Failed to connect to WiFi. Starting Access Point mode..."));
+    
+    // Start Access Point
+    WiFi.mode(WIFI_AP);
+    String apName = "Seismometer-" + String(WiFi.macAddress().substring(9, 17));
+    apName.replace(":", "");
+    
+    if (WiFi.softAP(apName.c_str(), "seismo123")) {
+      Serial.println(F("Access Point started"));
+      Serial.print(F("AP Name: "));
+      Serial.println(apName);
+      Serial.print(F("AP IP Address: "));
+      Serial.println(WiFi.softAPIP());
+      Serial.println(F("Connect to this AP and go to http://192.168.4.1 to configure WiFi"));
+      
+      // Display AP info on OLED
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 5);
+      display.println("WiFi Setup Mode");
+      display.setCursor(0, 20);
+      display.println("Connect to:");
+      display.setCursor(0, 35);
+      display.println(apName);
+      display.setCursor(0, 50);
+      display.println("192.168.4.1");
+      display.display();
+      delay(3000);
+    } else {
+      Serial.println(F("Failed to start Access Point"));
+    }
   }
 }
 
@@ -827,9 +874,14 @@ void setupBLE() {
 }
 
 void handleRoot() {
-  String page = FPSTR(WIFI_HTML_PAGE);
-  page.replace("%IP_ADDRESS%", WiFi.localIP().toString());
-  server.send(200, "text/html", page);
+  // If in AP mode, show WiFi config page, otherwise show normal dashboard
+  if (WiFi.getMode() == WIFI_AP) {
+    handleWifiConfig();
+  } else {
+    String page = FPSTR(WIFI_HTML_PAGE);
+    page.replace("%IP_ADDRESS%", WiFi.localIP().toString());
+    server.send(200, "text/html", page);
+  }
 }
 
 void handleData() {
@@ -841,9 +893,108 @@ void handleBleViewer() {
   server.send(200, "text/html", HTML_PAGE);
 }
 
-void handleReset() {
-  resetPeakValues();
-  server.send(204, "text/plain", ""); // 204 No Content is a good response for a successful action with no reply body
+void handleWifiConfig() {
+  String html = "<!DOCTYPE html><html><head><title>Seismometer WiFi Setup</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0}";
+  html += ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
+  html += "h1{color:#333;text-align:center;margin-bottom:30px}";
+  html += ".form-group{margin-bottom:20px}";
+  html += "label{display:block;margin-bottom:5px;font-weight:bold;color:#555}";
+  html += "input[type='text'],input[type='password']{width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;font-size:16px;box-sizing:border-box}";
+  html += "button{width:100%;padding:12px;background:#007bff;color:white;border:none;border-radius:5px;font-size:16px;cursor:pointer}";
+  html += "button:hover{background:#0056b3}";
+  html += ".status{text-align:center;margin-top:20px;padding:10px;background:#e7f3ff;border-radius:5px}";
+  html += ".sensor-data{margin-top:20px;padding:15px;background:#f8f9fa;border-radius:5px}";
+  html += ".sensor-data h3{margin-top:0;color:#333}";
+  html += ".mercalli{font-size:24px;font-weight:bold;color:#dc3545}";
+  html += ".refresh-btn{margin-top:10px;padding:8px 16px;background:#28a745;color:white;border:none;border-radius:5px;cursor:pointer}";
+  html += "</style></head><body>";
+  html += "<div class='container'>";
+  html += "<h1>🌍 Seismometer WiFi Setup</h1>";
+  html += "<form action='/save' method='POST'>";
+  html += "<div class='form-group'>";
+  html += "<label for='ssid'>WiFi Network Name (SSID):</label>";
+  html += "<input type='text' id='ssid' name='ssid' required>";
+  html += "</div>";
+  html += "<div class='form-group'>";
+  html += "<label for='password'>WiFi Password:</label>";
+  html += "<input type='password' id='password' name='password'>";
+  html += "</div>";
+  html += "<button type='submit'>Save & Connect</button>";
+  html += "</form>";
+  html += "<div class='status'>";
+  html += "<p><strong>Current Status:</strong> Access Point Mode</p>";
+  html += "<p>Device continues monitoring seismic activity</p>";
+  html += "</div>";
+  html += "<div class='sensor-data'>";
+  html += "<h3>Live Seismic Data</h3>";
+  html += "<div id='sensorInfo'>Loading...</div>";
+  html += "<button class='refresh-btn' onclick='updateSensorData()'>Refresh Data</button>";
+  html += "</div>";
+  html += "</div>";
+  html += "<script>";
+  html += "function updateSensorData(){";
+  html += "fetch('/data').then(response=>response.json()).then(data=>{";
+  html += "document.getElementById('sensorInfo').innerHTML=";
+  html += "'<div class=\"mercalli\">Mercalli Peak: '+data.mercalli_peak+'</div>';";
+  html += "document.getElementById('sensorInfo').innerHTML+=";
+  html += "'<div>Current: '+data.mercalli_now+'</div>';";
+  html += "document.getElementById('sensorInfo').innerHTML+=";
+  html += "'<div>Peak Deviations - X: '+data.x_peak.toFixed(3)+', Y: '+data.y_peak.toFixed(3)+', Z: '+data.z_peak.toFixed(3)+'</div>';";
+  html += "}).catch(error=>{";
+  html += "document.getElementById('sensorInfo').innerHTML='Error loading sensor data';";
+  html += "});}";
+  html += "setInterval(updateSensorData,5000);";
+  html += "updateSensorData();";
+  html += "</script>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleWifiSave() {
+  if (server.hasArg("ssid")) {
+    String newSsid = server.arg("ssid");
+    String newPass = server.hasArg("password") ? server.arg("password") : "";
+    
+    Serial.println("WiFi credentials received via web interface:");
+    Serial.println("SSID: " + newSsid);
+    if (newPass.length() > 0) {
+      Serial.println("Password: [set]");
+    } else {
+      Serial.println("Password: [empty]");
+    }
+    
+    // Save new credentials
+    ssid = newSsid;
+    password = newPass;
+    saveWifiCredentials();
+    
+    // Send success response
+    String html = "<!DOCTYPE html><html><head><title>WiFi Saved</title>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<style>body{font-family:Arial,sans-serif;margin:20px;text-align:center;background:#f0f0f0}";
+    html += ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
+    html += "h1{color:#28a745}h2{color:#333}</style></head><body>";
+    html += "<div class='container'>";
+    html += "<h1>✅ WiFi Settings Saved!</h1>";
+    html += "<h2>Connecting to: " + newSsid + "</h2>";
+    html += "<p>The device will restart and attempt to connect to your WiFi network.</p>";
+    html += "<p>If successful, you can access the seismometer dashboard at its new IP address.</p>";
+    html += "<p>If connection fails, the device will return to Access Point mode.</p>";
+    html += "</div>";
+    html += "<script>setTimeout(function(){window.close();},5000);</script>";
+    html += "</body></html>";
+    
+    server.send(200, "text/html", html);
+    
+    delay(2000);
+    Serial.println("Rebooting to apply new WiFi settings...");
+    ESP.restart();
+  } else {
+    server.send(400, "text/plain", "Missing SSID parameter");
+  }
 }
 
 void saveWifiCredentials() {
@@ -933,4 +1084,9 @@ String getSensorDataJson() {
   json += "\"dev_mag_now\":" + String(dev_mag) + "}";
   
   return json;
+}
+
+void handleReset() {
+  resetPeakValues();
+  server.send(204, "text/plain", ""); // 204 No Content is a good response for a successful action with no reply body
 }
