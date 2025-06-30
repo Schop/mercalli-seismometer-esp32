@@ -894,6 +894,9 @@ void handleBleViewer() {
 }
 
 void handleWifiConfig() {
+  // Scan for available WiFi networks
+  int numNetworks = WiFi.scanNetworks();
+  
   String html = "<!DOCTYPE html><html><head><title>Seismometer WiFi Setup</title>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<style>body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0}";
@@ -901,7 +904,7 @@ void handleWifiConfig() {
   html += "h1{color:#333;text-align:center;margin-bottom:30px}";
   html += ".form-group{margin-bottom:20px}";
   html += "label{display:block;margin-bottom:5px;font-weight:bold;color:#555}";
-  html += "input[type='text'],input[type='password']{width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;font-size:16px;box-sizing:border-box}";
+  html += "input[type='text'],input[type='password'],select{width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;font-size:16px;box-sizing:border-box}";
   html += "button{width:100%;padding:12px;background:#007bff;color:white;border:none;border-radius:5px;font-size:16px;cursor:pointer}";
   html += "button:hover{background:#0056b3}";
   html += ".status{text-align:center;margin-top:20px;padding:10px;background:#e7f3ff;border-radius:5px}";
@@ -909,17 +912,47 @@ void handleWifiConfig() {
   html += ".sensor-data h3{margin-top:0;color:#333}";
   html += ".mercalli{font-size:24px;font-weight:bold;color:#dc3545}";
   html += ".refresh-btn{margin-top:10px;padding:8px 16px;background:#28a745;color:white;border:none;border-radius:5px;cursor:pointer}";
+  html += ".wifi-network{padding:8px;margin:5px 0;border:1px solid #ddd;border-radius:5px;cursor:pointer;background:#f9f9f9}";
+  html += ".wifi-network:hover{background:#e9ecef}";
+  html += ".wifi-network.selected{background:#007bff;color:white}";
+  html += ".signal-strength{float:right;font-size:12px;color:#666}";
+  html += ".wifi-network.selected .signal-strength{color:#ccc}";
   html += "</style></head><body>";
   html += "<div class='container'>";
   html += "<h1>🌍 Seismometer WiFi Setup</h1>";
   html += "<form action='/save' method='POST'>";
   html += "<div class='form-group'>";
-  html += "<label for='ssid'>WiFi Network Name (SSID):</label>";
-  html += "<input type='text' id='ssid' name='ssid' required>";
+  html += "<label for='ssid'>Select WiFi Network:</label>";
+  
+  // Add available networks
+  if (numNetworks > 0) {
+    html += "<div id='networkList'>";
+    for (int i = 0; i < numNetworks; i++) {
+      String networkSSID = WiFi.SSID(i);
+      int32_t rssi = WiFi.RSSI(i);
+      String encType = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Secured";
+      
+      // Convert RSSI to signal strength percentage
+      int signalStrength = 2 * (rssi + 100);
+      if (signalStrength > 100) signalStrength = 100;
+      if (signalStrength < 0) signalStrength = 0;
+      
+      html += "<div class='wifi-network' onclick='selectNetwork(\"" + networkSSID + "\")'>";
+      html += "<span>" + networkSSID + "</span>";
+      html += "<span class='signal-strength'>" + String(signalStrength) + "% (" + encType + ")</span>";
+      html += "</div>";
+    }
+    html += "</div>";
+    html += "<p style='margin-top:10px;font-size:14px;color:#666;'>Or enter network name manually:</p>";
+  } else {
+    html += "<p style='color:#dc3545;'>No WiFi networks found. Please enter network name manually.</p>";
+  }
+  
+  html += "<input type='text' id='ssid' name='ssid' placeholder='Enter WiFi network name' required>";
   html += "</div>";
   html += "<div class='form-group'>";
   html += "<label for='password'>WiFi Password:</label>";
-  html += "<input type='password' id='password' name='password'>";
+  html += "<input type='password' id='password' name='password' placeholder='Enter password (leave empty for open networks)'>";
   html += "</div>";
   html += "<button type='submit'>Save & Connect</button>";
   html += "</form>";
@@ -934,6 +967,11 @@ void handleWifiConfig() {
   html += "</div>";
   html += "</div>";
   html += "<script>";
+  html += "function selectNetwork(ssid){";
+  html += "document.getElementById('ssid').value=ssid;";
+  html += "document.querySelectorAll('.wifi-network').forEach(n=>n.classList.remove('selected'));";
+  html += "event.target.closest('.wifi-network').classList.add('selected');";
+  html += "}";
   html += "function updateSensorData(){";
   html += "fetch('/data').then(response=>response.json()).then(data=>{";
   html += "document.getElementById('sensorInfo').innerHTML=";
