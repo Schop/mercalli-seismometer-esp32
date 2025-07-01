@@ -473,9 +473,9 @@ void checkForSerialCommand() {
         Serial.println(WiFi.softAPIP());
       } else {
         Serial.println(F("Offline"));
-        Serial.print(F("  Configured SSID: "));
-        Serial.println(ssid);
       }
+      Serial.print(F("  Configured SSID: "));
+      Serial.println(ssid);      
       Serial.print(F("  Stored Password: "));
       if (password.length() > 0) {
           Serial.println(password);
@@ -919,7 +919,7 @@ void handleWifiConfig() {
   html += ".wifi-network.selected .signal-strength{color:#ccc}";
   html += "</style></head><body>";
   html += "<div class='container'>";
-  html += "<h1>🌍 Seismometer WiFi Setup</h1>";
+  html += "<h1>Seismometer WiFi Setup</h1>";
   html += "<form action='/save' method='POST'>";
   html += "<div class='form-group'>";
   html += "<label for='ssid'>Select WiFi Network:</label>";
@@ -992,14 +992,20 @@ void handleWifiConfig() {
 }
 
 void handleWifiSave() {
+  Serial.println(F("=== WiFi Save Request Received ==="));
+  
   if (server.hasArg("ssid")) {
     String newSsid = server.arg("ssid");
     String newPass = server.hasArg("password") ? server.arg("password") : "";
     
     Serial.println("WiFi credentials received via web interface:");
-    Serial.println("SSID: " + newSsid);
+    Serial.print("SSID: '");
+    Serial.print(newSsid);
+    Serial.println("'");
     if (newPass.length() > 0) {
-      Serial.println("Password: [set]");
+      Serial.print("Password: [set, length: ");
+      Serial.print(newPass.length());
+      Serial.println("]");
     } else {
       Serial.println("Password: [empty]");
     }
@@ -1007,7 +1013,9 @@ void handleWifiSave() {
     // Save new credentials
     ssid = newSsid;
     password = newPass;
+    Serial.println(F("Calling saveWifiCredentials()..."));
     saveWifiCredentials();
+    Serial.println(F("saveWifiCredentials() completed."));
     
     // Send success response
     String html = "<!DOCTYPE html><html><head><title>WiFi Saved</title>";
@@ -1016,7 +1024,7 @@ void handleWifiSave() {
     html += ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
     html += "h1{color:#28a745}h2{color:#333}</style></head><body>";
     html += "<div class='container'>";
-    html += "<h1>✅ WiFi Settings Saved!</h1>";
+    html += "<h1>WiFi Settings Saved!</h1>";
     html += "<h2>Connecting to: " + newSsid + "</h2>";
     html += "<p>The device will restart and attempt to connect to your WiFi network.</p>";
     html += "<p>If successful, you can access the seismometer dashboard at its new IP address.</p>";
@@ -1027,10 +1035,12 @@ void handleWifiSave() {
     
     server.send(200, "text/html", html);
     
+    Serial.println(F("Response sent. Waiting 2 seconds before reboot..."));
     delay(2000);
     Serial.println("Rebooting to apply new WiFi settings...");
     ESP.restart();
   } else {
+    Serial.println(F("ERROR: Missing SSID parameter in WiFi save request"));
     server.send(400, "text/plain", "Missing SSID parameter");
   }
 }
@@ -1046,18 +1056,55 @@ void saveWifiCredentials() {
   // Write SSID to EEPROM
   Serial.print(F("Writing SSID: "));
   Serial.println(ssid);
-  for (int i = 0; i < ssid.length(); ++i) {
+  for (int i = 0; i < ssid.length() && i < (SSID_LEN - 1); ++i) {
     EEPROM.write(SSID_ADDR + i, ssid[i]);
   }
+  // Ensure null termination
+  EEPROM.write(SSID_ADDR + min((int)ssid.length(), SSID_LEN - 1), 0);
   
   // Write Password to EEPROM
-  Serial.println(F("Writing Password."));
-  for (int i = 0; i < password.length(); ++i) {
-    EEPROM.write(PASS_ADDR + i, password[i]);
+  Serial.print(F("Writing Password: "));
+  if (password.length() > 0) {
+    Serial.print(F("[length: "));
+    Serial.print(password.length());
+    Serial.println(F("]"));
+    for (int i = 0; i < password.length() && i < (PASS_LEN - 1); ++i) {
+      EEPROM.write(PASS_ADDR + i, password[i]);
+    }
+    // Ensure null termination
+    EEPROM.write(PASS_ADDR + min((int)password.length(), PASS_LEN - 1), 0);
+  } else {
+    Serial.println(F("[empty]"));
   }
   
   if (EEPROM.commit()) {
     Serial.println(F("Credentials saved successfully."));
+    
+    // Verify what was written
+    Serial.println(F("Verification - reading back from EEPROM:"));
+    String testSsid = "";
+    for (int i = 0; i < SSID_LEN; ++i) {
+      char c = EEPROM.read(SSID_ADDR + i);
+      if (c == 0) break;
+      testSsid += c;
+    }
+    Serial.print(F("  SSID read back: "));
+    Serial.println(testSsid);
+    
+    String testPass = "";
+    for (int i = 0; i < PASS_LEN; ++i) {
+      char c = EEPROM.read(PASS_ADDR + i);
+      if (c == 0) break;
+      testPass += c;
+    }
+    Serial.print(F("  Password read back: "));
+    if (testPass.length() > 0) {
+      Serial.print(F("[length: "));
+      Serial.print(testPass.length());
+      Serial.println(F("]"));
+    } else {
+      Serial.println(F("[empty]"));
+    }
   } else {
     Serial.println(F("ERROR: Failed to commit credentials to EEPROM."));
   }
@@ -1067,19 +1114,24 @@ void loadWifiCredentials() {
   Serial.println(F("Loading WiFi credentials from EEPROM..."));
   
   // Read SSID
-  char ssid_buf[SSID_LEN] = {0};
+  String loadedSsid = "";
   for (int i = 0; i < SSID_LEN; ++i) {
-    ssid_buf[i] = EEPROM.read(SSID_ADDR + i);
+    char c = EEPROM.read(SSID_ADDR + i);
+    if (c == 0) break; // Stop at null terminator
+    if (c != 255) { // 255 is uninitialized EEPROM value
+      loadedSsid += c;
+    }
   }
   
   // Read Password
-  char pass_buf[PASS_LEN] = {0};
+  String loadedPass = "";
   for (int i = 0; i < PASS_LEN; ++i) {
-    pass_buf[i] = EEPROM.read(PASS_ADDR + i);
+    char c = EEPROM.read(PASS_ADDR + i);
+    if (c == 0) break; // Stop at null terminator
+    if (c != 255) { // 255 is uninitialized EEPROM value
+      loadedPass += c;
+    }
   }
-
-  String loadedSsid = String(ssid_buf);
-  String loadedPass = String(pass_buf);
 
   if (loadedSsid.length() > 0) {
     ssid = loadedSsid;
