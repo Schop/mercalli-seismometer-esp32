@@ -10,6 +10,7 @@
 #include <BLEServer.h>
 #include <BLE2902.h>
 #include <EEPROM.h>
+#include <time.h>
 #include "ble_viewer.h"
 #include "wifi_viewer.h"
 
@@ -23,6 +24,32 @@ String password = "YOUR_PASSWORD_HERE"; // Set your WiFi password here
 #define SSID_LEN  64
 #define PASS_ADDR 64
 #define PASS_LEN  64
+
+// NTP Time configuration
+const char* ntpServer1 = "pool.ntp.org";
+const char* ntpServer2 = "time.nist.gov";
+const char* ntpServer3 = "time.google.com";
+const long gmtOffset_sec = 0;  // UTC time
+const int daylightOffset_sec = 0;
+bool timeInitialized = false;
+
+// Event logging configuration
+#define MAX_EVENTS 50  // Maximum number of events to store
+struct SeismicEvent {
+  time_t timestamp;
+  float mercalli;
+  float x_peak;
+  float y_peak;
+  float z_peak;
+  float magnitude;
+};
+
+SeismicEvent eventLog[MAX_EVENTS];
+int eventCount = 0;
+int eventIndex = 0;  // Circular buffer index
+float lastLoggedMercalli = 0;
+unsigned long lastEventTime = 0;
+const unsigned long MIN_EVENT_INTERVAL = 10000;  // Minimum 10 seconds between logged events
 
 // Display configuration
 #define SCREEN_WIDTH 128
@@ -126,6 +153,7 @@ void checkForSerialCommand();
 void calibrateAccelerometer();
 int calculateMercalli(float magnitude);
 void setupWifi();
+void startAccessPoint();
 void setupBLE();
 void handleRoot();
 void handleData();
@@ -137,6 +165,13 @@ String getSensorDataJson();
 void saveWifiCredentials();
 void loadWifiCredentials();
 void printStatus();
+void initializeTime();
+void logSeismicEvent(float mercalli, float x, float y, float z, float mag);
+void clearEventLog();
+void handleEvents();
+void handleClearEvents();
+String getEventsJson();
+String formatTimestamp(time_t timestamp);
 
 // BLE Callback Classes
 class MyServerCallbacks: public BLEServerCallbacks {
@@ -223,14 +258,34 @@ void setup() {
   
   // Start web server if WiFi is connected OR in AP mode
   if (WiFi.status() == WL_CONNECTED || WiFi.getMode() == WIFI_AP) {
+    Serial.println(F("Setting up web server routes..."));
     server.on("/", HTTP_GET, handleRoot);
     server.on("/data", HTTP_GET, handleData);
     server.on("/reset", HTTP_POST, handleReset);
     server.on("/ble", HTTP_GET, handleBleViewer);
     server.on("/config", HTTP_GET, handleWifiConfig);
     server.on("/save", HTTP_POST, handleWifiSave);
+    server.on("/events", HTTP_GET, handleEvents);
+    server.on("/clearevents", HTTP_POST, handleClearEvents);
+
+    
+    // Add catch-all handler for debugging
+    server.onNotFound([](){
+      server.send(404, "text/plain", "Not found");
+    });
+    
     server.begin();
-    Serial.println("Web server started");
+    Serial.println("Web server started successfully");
+    Serial.print(F("Server listening on: "));
+    if (WiFi.getMode() == WIFI_AP) {
+      Serial.println(F("192.168.4.1"));
+    } else {
+      Serial.println(WiFi.localIP());
+      // Initialize NTP time sync when connected to internet
+      initializeTime();
+    }
+  } else {
+    Serial.println(F("No WiFi connection - web server not started"));
   }
 
   // Setup BLE
@@ -244,7 +299,7 @@ void setup() {
   
   
   Serial.println(F("Seismometer initialized successfully."));
-  Serial.println(F("Available serial commands: STATUS, RESET, CALIBRATE, SSID <name>, PASS <password>, BOOT"));
+  Serial.println(F("Available serial commands: STATUS, RESET, CLEAREVENTS, CALIBRATE, SSID <name>, PASS <password>, BOOT"));
   Serial.println(F("Press button on GPIO 4 to reset peak values."));
   
   if (WiFi.getMode() == WIFI_AP) {
@@ -254,6 +309,22 @@ void setup() {
 }
 
 void loop() {
+  // Ensure WiFi mode stability - if we're supposed to be in AP mode but lost it, restart AP
+  static bool wasInApMode = false;
+  static unsigned long lastModeCheck = 0;
+  
+  if (millis() - lastModeCheck >= 5000) { // Check every 5 seconds
+    lastModeCheck = millis();
+    
+    if (WiFi.getMode() == WIFI_AP) {
+      wasInApMode = true;
+    } else if (wasInApMode && WiFi.status() != WL_CONNECTED) {
+      // We were in AP mode but lost it, and we're not connected to a WiFi network
+      Serial.println(F("WARNING: Lost AP mode! Restarting Access Point..."));
+      startAccessPoint();
+    }
+  }
+  
   // Handle web server requests
   if (WiFi.status() == WL_CONNECTED || WiFi.getMode() == WIFI_AP) {
     server.handleClient();
@@ -261,6 +332,16 @@ void loop() {
 
   // Check for reset command
   checkForSerialCommand();
+  
+  // Add periodic status check every 60 seconds
+  static unsigned long lastStatusCheck = 0;
+  if (millis() - lastStatusCheck >= 60000) {
+    lastStatusCheck = millis();
+    if (WiFi.getMode() == WIFI_AP) {
+      Serial.print(F("AP Mode - Connected clients: "));
+      Serial.println(WiFi.softAPgetStationNum());
+    }
+  }
   
   if (millis() - lastUpdate >= updateInterval) {
     // Get a new sensor reading
@@ -310,6 +391,42 @@ void loop() {
       if (deviation_magnitude > deviation_magnitude_peak) {
         deviation_magnitude_peak = deviation_magnitude;
         mercalli_peak = calculateMercalli(deviation_magnitude_peak);
+      }
+      
+      // Log significant seismic events when connected to internet
+      if (timeInitialized) {
+        int current_mercalli = calculateMercalli(deviation_magnitude);
+        
+        // Log events that are:
+        // 1. Mercalli V (5) and above - always log if higher than last OR interval passed
+        // 2. Mercalli III-IV - log if interval passed AND higher than last
+        // 3. Always log if increase is significant (2+ Mercalli levels), regardless of time
+        bool shouldLog = false;
+        bool intervalPassed = (millis() - lastEventTime >= MIN_EVENT_INTERVAL);
+        bool isHigherThanLast = (current_mercalli > lastLoggedMercalli);
+        bool significantIncrease = (current_mercalli - lastLoggedMercalli >= 2);
+        
+        if (current_mercalli >= 5) {
+          // Always log Mercalli V and above if enough time has passed OR if it's higher than last
+          shouldLog = intervalPassed || isHigherThanLast;
+        } else if (current_mercalli >= 3) {
+          // Log Mercalli III-IV if interval passed and higher, OR if it's a significant jump
+          shouldLog = (intervalPassed && isHigherThanLast) || significantIncrease;
+        }
+        
+        if (shouldLog) {
+          // Use current values, not peak values for event logging
+          float x_dev = abs(x_accel - x_baseline);
+          float y_dev = abs(y_accel - y_baseline);
+          float z_dev = abs(z_accel - z_baseline);
+          if (x_dev < noise_threshold) x_dev = 0;
+          if (y_dev < noise_threshold) y_dev = 0;
+          if (z_dev < noise_threshold) z_dev = 0;
+          
+          logSeismicEvent(current_mercalli, x_dev, y_dev, z_dev, deviation_magnitude);
+          lastLoggedMercalli = current_mercalli;
+          lastEventTime = millis();
+        }
       }
       
       // Still track raw magnitude peak for reference
@@ -419,6 +536,7 @@ void resetPeakValues() {
   deviation_magnitude_peak = 0;
   mercalli_peak = 0;
   sample_count = 0; // Reset baseline establishment
+  lastLoggedMercalli = 0;  // Reset event logging threshold
   Serial.println("Peak values and baseline reset.");
   
   // Show reset confirmation on display briefly
@@ -448,6 +566,8 @@ void checkForSerialCommand() {
 
     if (upperCommand == "RESET") {
       resetPeakValues();
+    } else if (upperCommand == "CLEAREVENTS") {
+      clearEventLog();
     } else if (upperCommand == "CALIBRATE") {
       calibrateAccelerometer();
     } else if (upperCommand == "BOOT") {
@@ -784,8 +904,21 @@ int calculateMercalli(float magnitude) {
 
 void setupWifi() {
   delay(10);
-  Serial.print(F("Connecting to WiFi"));
+  
+  // First, check if we have valid credentials
+  if (ssid.length() == 0 || ssid == "YOUR_SSID_HERE") {
+    Serial.println(F("No valid WiFi credentials found. Starting Access Point mode..."));
+    startAccessPoint();
+    return;
+  }
+  
+  Serial.print(F("Connecting to WiFi: "));
+  Serial.println(ssid);
 
+  // Set WiFi to station mode first
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
   // Attempt to connect to WiFi network
   WiFi.begin(ssid.c_str(), password.c_str());
   
@@ -805,37 +938,57 @@ void setupWifi() {
     Serial.println(WiFi.localIP());
   } else {
     Serial.println(F("Failed to connect to WiFi. Starting Access Point mode..."));
+    startAccessPoint();
+  }
+}
+
+void startAccessPoint() {
+  Serial.println(F("Starting Access Point mode..."));
+  
+  // Force disconnect from any existing WiFi connection
+  WiFi.disconnect(true);
+  delay(200);
+  
+  // Explicitly set mode to AP only and wait for it to be set
+  WiFi.mode(WIFI_AP);
+  delay(200);
+  
+  String apName = "Seismometer";
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  apName += "-" + mac.substring(6); // Add last 6 chars of MAC for uniqueness
+  
+  // Configure AP with specific settings - do this before starting AP
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  delay(100);
+  
+  // Start the Access Point with no password (open network)
+  if (WiFi.softAP(apName.c_str())) {
+    delay(500); // Allow time for AP to fully initialize
     
-    // Start Access Point
-    WiFi.mode(WIFI_AP);
-    String apName = "Seismometer";
-    apName.replace(":", "");
+    Serial.println(F("Access Point started successfully"));
+    Serial.print(F("AP Name: "));
+    Serial.println(apName);
+    Serial.print(F("AP IP Address: "));
+    Serial.println(WiFi.softAPIP());
+    Serial.println(F("Connect to this AP and go to http://192.168.4.1 to configure WiFi"));
     
-    if (WiFi.softAP(apName.c_str())) {
-      Serial.println(F("Access Point started"));
-      Serial.print(F("AP Name: "));
-      Serial.println(apName);
-      Serial.print(F("AP IP Address: "));
-      Serial.println(WiFi.softAPIP());
-      Serial.println(F("Connect to this AP and go to http://192.168.4.1 to configure WiFi"));
-      
-      // Display AP info on OLED
-      display.clearDisplay();
-      display.setTextSize(1);
-      display.setTextColor(SSD1306_WHITE);
-      display.setCursor(0, 5);
-      display.println("WiFi Setup Mode");
-      display.setCursor(0, 20);
-      display.println("Connect to:");
-      display.setCursor(0, 35);
-      display.println(apName);
-      display.setCursor(0, 50);
-      display.println("192.168.4.1");
-      display.display();
-      delay(3000);
-    } else {
-      Serial.println(F("Failed to start Access Point"));
-    }
+    // Display AP info on OLED
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 5);
+    display.println("WiFi Setup Mode");
+    display.setCursor(0, 20);
+    display.println("Connect to:");
+    display.setCursor(0, 35);
+    display.println(apName);
+    display.setCursor(0, 50);
+    display.println("192.168.4.1");
+    display.display();
+    delay(2000);
+  } else {
+    Serial.println(F("Failed to start Access Point"));
   }
 }
 
@@ -985,6 +1138,25 @@ void handleWifiConfig() {
   html += "});}";
   html += "setInterval(updateSensorData,5000);";
   html += "updateSensorData();";
+  html += "document.addEventListener('DOMContentLoaded',function(){";
+  html += "const form=document.querySelector('form');";
+  html += "form.addEventListener('submit',function(e){";
+  html += "console.log('Form submit event triggered');";
+  html += "const ssid=document.getElementById('ssid').value.trim();";
+  html += "const password=document.getElementById('password').value;";
+  html += "console.log('SSID: ' + ssid + ', Password length: ' + password.length);";
+  html += "if(!ssid){";
+  html += "e.preventDefault();";
+  html += "alert('Please enter a WiFi network name');";
+  html += "console.log('Form submission prevented - no SSID');";
+  html += "return false;";
+  html += "}";
+  html += "console.log('Form validation passed, submitting...');";
+  html += "document.querySelector('button[type=submit]').textContent='Saving...';";
+  html += "document.querySelector('button[type=submit]').disabled=true;";
+  html += "console.log('Button updated, form will submit now');";
+  html += "});";
+  html += "});";
   html += "</script>";
   html += "</body></html>";
   
@@ -992,32 +1164,29 @@ void handleWifiConfig() {
 }
 
 void handleWifiSave() {
-  Serial.println(F("=== WiFi Save Request Received ==="));
+  Serial.println(F("WiFi credentials received via web interface"));
   
   if (server.hasArg("ssid")) {
     String newSsid = server.arg("ssid");
     String newPass = server.hasArg("password") ? server.arg("password") : "";
     
-    Serial.println("WiFi credentials received via web interface:");
-    Serial.print("SSID: '");
-    Serial.print(newSsid);
-    Serial.println("'");
-    if (newPass.length() > 0) {
-      Serial.print("Password: [set, length: ");
-      Serial.print(newPass.length());
-      Serial.println("]");
-    } else {
-      Serial.println("Password: [empty]");
+    // Validate input
+    if (newSsid.length() == 0) {
+      server.send(400, "text/plain", "SSID cannot be empty");
+      return;
     }
     
-    // Save new credentials
-    ssid = newSsid;
-    password = newPass;
-    Serial.println(F("Calling saveWifiCredentials()..."));
-    saveWifiCredentials();
-    Serial.println(F("saveWifiCredentials() completed."));
+    if (newSsid.length() > 63) {
+      server.send(400, "text/plain", "SSID too long (max 63 characters)");
+      return;
+    }
     
-    // Send success response
+    if (newPass.length() > 63) {
+      server.send(400, "text/plain", "Password too long (max 63 characters)");
+      return;
+    }
+    
+    // Send response FIRST, before doing anything that might cause issues
     String html = "<!DOCTYPE html><html><head><title>WiFi Saved</title>";
     html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
     html += "<style>body{font-family:Arial,sans-serif;margin:20px;text-align:center;background:#f0f0f0}";
@@ -1030,23 +1199,29 @@ void handleWifiSave() {
     html += "<p>If successful, you can access the seismometer dashboard at its new IP address.</p>";
     html += "<p>If connection fails, the device will return to Access Point mode.</p>";
     html += "</div>";
-    html += "<script>setTimeout(function(){window.close();},5000);</script>";
     html += "</body></html>";
     
     server.send(200, "text/html", html);
     
-    Serial.println(F("Response sent. Waiting 2 seconds before reboot..."));
-    delay(2000);
+    // Now save the credentials
+    ssid = newSsid;
+    password = newPass;
+    saveWifiCredentials();
+    
+    delay(3000);
     Serial.println("Rebooting to apply new WiFi settings...");
     ESP.restart();
   } else {
-    Serial.println(F("ERROR: Missing SSID parameter in WiFi save request"));
     server.send(400, "text/plain", "Missing SSID parameter");
   }
 }
 
 void saveWifiCredentials() {
-  Serial.println(F("Saving WiFi credentials to EEPROM..."));
+  // Ensure we don't exceed memory bounds
+  if (ssid.length() >= SSID_LEN || password.length() >= PASS_LEN) {
+    Serial.println(F("ERROR: Credentials too long for EEPROM storage"));
+    return;
+  }
   
   // Clear the EEPROM region for credentials before writing
   for (int i = 0; i < EEPROM_SIZE; i++) {
@@ -1054,8 +1229,6 @@ void saveWifiCredentials() {
   }
 
   // Write SSID to EEPROM
-  Serial.print(F("Writing SSID: "));
-  Serial.println(ssid);
   for (int i = 0; i < ssid.length() && i < (SSID_LEN - 1); ++i) {
     EEPROM.write(SSID_ADDR + i, ssid[i]);
   }
@@ -1063,56 +1236,22 @@ void saveWifiCredentials() {
   EEPROM.write(SSID_ADDR + min((int)ssid.length(), SSID_LEN - 1), 0);
   
   // Write Password to EEPROM
-  Serial.print(F("Writing Password: "));
   if (password.length() > 0) {
-    Serial.print(F("[length: "));
-    Serial.print(password.length());
-    Serial.println(F("]"));
     for (int i = 0; i < password.length() && i < (PASS_LEN - 1); ++i) {
       EEPROM.write(PASS_ADDR + i, password[i]);
     }
     // Ensure null termination
     EEPROM.write(PASS_ADDR + min((int)password.length(), PASS_LEN - 1), 0);
-  } else {
-    Serial.println(F("[empty]"));
   }
   
   if (EEPROM.commit()) {
-    Serial.println(F("Credentials saved successfully."));
-    
-    // Verify what was written
-    Serial.println(F("Verification - reading back from EEPROM:"));
-    String testSsid = "";
-    for (int i = 0; i < SSID_LEN; ++i) {
-      char c = EEPROM.read(SSID_ADDR + i);
-      if (c == 0) break;
-      testSsid += c;
-    }
-    Serial.print(F("  SSID read back: "));
-    Serial.println(testSsid);
-    
-    String testPass = "";
-    for (int i = 0; i < PASS_LEN; ++i) {
-      char c = EEPROM.read(PASS_ADDR + i);
-      if (c == 0) break;
-      testPass += c;
-    }
-    Serial.print(F("  Password read back: "));
-    if (testPass.length() > 0) {
-      Serial.print(F("[length: "));
-      Serial.print(testPass.length());
-      Serial.println(F("]"));
-    } else {
-      Serial.println(F("[empty]"));
-    }
+    Serial.println(F("WiFi credentials saved to EEPROM"));
   } else {
-    Serial.println(F("ERROR: Failed to commit credentials to EEPROM."));
+    Serial.println(F("ERROR: Failed to save credentials to EEPROM"));
   }
 }
 
 void loadWifiCredentials() {
-  Serial.println(F("Loading WiFi credentials from EEPROM..."));
-  
   // Read SSID
   String loadedSsid = "";
   for (int i = 0; i < SSID_LEN; ++i) {
@@ -1137,15 +1276,11 @@ void loadWifiCredentials() {
     ssid = loadedSsid;
     Serial.print(F("Loaded SSID: "));
     Serial.println(ssid);
-  } else {
-    Serial.println(F("No SSID found in EEPROM, using default."));
   }
 
   if (loadedPass.length() > 0) {
     password = loadedPass;
-    Serial.println(F("Loaded password from EEPROM."));
-  } else {
-    Serial.println(F("No password found in EEPROM, using default."));
+    Serial.println(F("Loaded password from EEPROM"));
   }
 }
 
@@ -1171,12 +1306,218 @@ String getSensorDataJson() {
   json += "\"x_now\":" + String(x_dev) + ",";
   json += "\"y_now\":" + String(y_dev) + ",";
   json += "\"z_now\":" + String(z_dev) + ",";
-  json += "\"dev_mag_now\":" + String(dev_mag) + "}";
+  json += "\"dev_mag_now\":" + String(dev_mag) + ",";
+  json += getEventsJson();
+  json += "}";
   
+  return json;
+}
+
+void initializeTime() {
+  Serial.println("Initializing NTP time sync...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3);
+  
+  // Wait for time to be set - be more patient
+  int attempts = 0;
+  time_t now;
+  while (attempts < 30) {  // Increased from 10 to 30 attempts
+    now = time(nullptr);
+    if (now > 1000000000) {  // Check if we have a reasonable timestamp (after year 2001)
+      timeInitialized = true;
+      Serial.println();
+      Serial.print("Time synchronized: ");
+      Serial.println(ctime(&now));
+      return;
+    }
+    Serial.print(".");
+    delay(1000);
+    attempts++;
+  }
+  
+  Serial.println();
+  Serial.println("Failed to sync time with NTP server");
+  timeInitialized = false;
+}
+
+void logSeismicEvent(float mercalli, float x, float y, float z, float mag) {
+  if (!timeInitialized) return;
+  
+  time_t now = time(nullptr);
+  
+  // Validate timestamp
+  if (now < 1000000000) {  // Less than year 2001, time sync issue
+    Serial.println("Event logging skipped - invalid timestamp");
+    return;
+  }
+  
+  // Store event in circular buffer
+  eventLog[eventIndex].timestamp = now;
+  eventLog[eventIndex].mercalli = mercalli;
+  eventLog[eventIndex].x_peak = x;
+  eventLog[eventIndex].y_peak = y;
+  eventLog[eventIndex].z_peak = z;
+  eventLog[eventIndex].magnitude = mag;
+  
+  eventIndex = (eventIndex + 1) % MAX_EVENTS;
+  if (eventCount < MAX_EVENTS) eventCount++;
+  
+  Serial.println("*** SEISMIC EVENT LOGGED ***");
+  Serial.print("Time: ");
+  Serial.print(ctime(&now));
+  Serial.print("Mercalli: ");
+  Serial.println(mercalli);
+  Serial.print("Current deviations - X: ");
+  Serial.print(x, 3);
+  Serial.print(", Y: ");
+  Serial.print(y, 3);
+  Serial.print(", Z: ");
+  Serial.println(z, 3);
+  Serial.print("Magnitude: ");
+  Serial.println(mag, 3);
+  Serial.println("**************************");
+}
+
+void clearEventLog() {
+  eventCount = 0;
+  eventIndex = 0;
+  lastLoggedMercalli = 0;
+  Serial.println("Event log cleared.");
+}
+
+String formatTimestamp(time_t timestamp) {
+  struct tm * timeinfo = localtime(&timestamp);
+  char buffer[32];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S UTC", timeinfo);
+  return String(buffer);
+}
+
+void handleEvents() {
+  // Check if client wants JSON data
+  if (server.hasArg("format") && server.arg("format") == "json") {
+    String json = "{";
+    json += "\"timeInitialized\":" + String(timeInitialized ? "true" : "false") + ",";
+    json += "\"eventCount\":" + String(eventCount) + ",";
+    json += "\"events\":[";
+    
+    if (eventCount > 0) {
+      // Show events in reverse chronological order (newest first)
+      for (int i = 0; i < eventCount; i++) {
+        int idx = (eventIndex - 1 - i + MAX_EVENTS) % MAX_EVENTS;
+        if (i > 0) json += ",";
+        
+        json += "{";
+        json += "\"timestamp\":\"" + formatTimestamp(eventLog[idx].timestamp) + "\",";
+        json += "\"mercalli\":" + String(eventLog[idx].mercalli) + ",";
+        json += "\"x_peak\":" + String(eventLog[idx].x_peak, 3) + ",";
+        json += "\"y_peak\":" + String(eventLog[idx].y_peak, 3) + ",";
+        json += "\"z_peak\":" + String(eventLog[idx].z_peak, 3) + ",";
+        json += "\"magnitude\":" + String(eventLog[idx].magnitude, 3);
+        json += "}";
+      }
+    }
+    
+    json += "]}";
+    server.send(200, "application/json", json);
+  } else {
+    // Serve HTML page for event viewing
+    String html = "<!DOCTYPE html><html><head><title>Seismic Event Log</title>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<style>body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0;color:#333}";
+    html += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
+    html += "h1{color:#333;text-align:center}";
+    html += ".status{text-align:center;padding:15px;margin:20px 0;border-radius:8px}";
+    html += ".status.online{background:#d4edda;border:1px solid #c3e6cb;color:#155724}";
+    html += ".status.offline{background:#f8d7da;border:1px solid #f5c6cb;color:#721c24}";
+    html += "table{width:100%;border-collapse:collapse;margin-top:20px}";
+    html += "th,td{padding:12px;text-align:left;border-bottom:1px solid #ddd}";
+    html += "th{background:#f8f9fa;font-weight:bold}";
+    html += ".mercalli{font-weight:bold;font-size:1.1em}";
+    html += ".mercalli-low{color:#28a745}";
+    html += ".mercalli-medium{color:#ffc107}";
+    html += ".mercalli-high{color:#dc3545}";
+    html += ".back-link{display:inline-block;margin-bottom:20px;padding:8px 16px;background:#007bff;color:white;text-decoration:none;border-radius:5px}";
+    html += ".back-link:hover{background:#0056b3}";
+    html += ".refresh-btn{margin-left:10px;padding:8px 16px;background:#28a745;color:white;border:none;border-radius:5px;cursor:pointer}";
+    html += ".clear-btn{margin-left:10px;padding:8px 16px;background:#dc3545;color:white;border:none;border-radius:5px;cursor:pointer}";
+    html += ".clear-btn:hover{background:#c82333}";
+    html += "</style></head><body>";
+    html += "<div class='container'>";
+    html += "<a href='/' class='back-link'>← Back to Dashboard</a>";
+    html += "<button class='refresh-btn' onclick='location.reload()'>Refresh</button>";
+    html += "<button class='clear-btn' onclick='clearEvents()'>Clear Events</button>";
+    html += "<h1>Seismic Event Log</h1>";
+    
+    if (timeInitialized) {
+      html += "<div class='status online'>Time synchronized - Event logging active</div>";
+      
+      if (eventCount > 0) {
+        html += "<p><strong>Total Events:</strong> " + String(eventCount) + " (Mercalli III and above)</p>";
+        html += "<table>";
+        html += "<tr><th>Timestamp (UTC)</th><th>Mercalli</th><th>Event Deviations (m/s²)</th><th>Magnitude</th></tr>";
+        
+        // Show events in reverse chronological order (newest first)
+        for (int i = 0; i < eventCount; i++) {
+          int idx = (eventIndex - 1 - i + MAX_EVENTS) % MAX_EVENTS;
+          
+          html += "<tr>";
+          html += "<td>" + formatTimestamp(eventLog[idx].timestamp) + "</td>";
+          
+          String mercalliClass = "mercalli-low";
+          if (eventLog[idx].mercalli >= 7) mercalliClass = "mercalli-high";
+          else if (eventLog[idx].mercalli >= 5) mercalliClass = "mercalli-medium";
+          
+          html += "<td class='mercalli " + mercalliClass + "'>" + String(eventLog[idx].mercalli) + "</td>";
+          html += "<td>X: " + String(eventLog[idx].x_peak, 3) + 
+                  ", Y: " + String(eventLog[idx].y_peak, 3) + 
+                  ", Z: " + String(eventLog[idx].z_peak, 3) + "</td>";
+          html += "<td>" + String(eventLog[idx].magnitude, 3) + "</td>";
+          html += "</tr>";
+        }
+        html += "</table>";
+      } else {
+        html += "<p style='text-align:center;color:#666;margin:40px 0;'>No seismic events recorded yet.</p>";
+        html += "<p style='text-align:center;color:#666;'>Events with Mercalli intensity III and above will be logged here.</p>";
+      }
+    } else {
+      html += "<div class='status offline'>Time not synchronized - Event logging disabled</div>";
+      html += "<p style='text-align:center;color:#666;'>Device must be connected to the internet for time synchronization and event logging.</p>";
+    }
+    
+    html += "</div></body>";
+    html += "<script>";
+    html += "function clearEvents(){";
+    html += "if(confirm('Are you sure you want to clear all event log entries? This cannot be undone.')){";
+    html += "fetch('/clearevents',{method:'POST'})";
+    html += ".then(response=>response.text())";
+    html += ".then(data=>{alert('Event log cleared successfully');location.reload();})";
+    html += ".catch(error=>{alert('Error clearing event log: '+error);});";
+    html += "}}";
+    html += "</script>";
+    html += "</html>";
+    server.send(200, "text/html", html);
+  }
+}
+
+String getEventsJson() {
+  String json = "\"eventCount\":" + String(eventCount) + ",";
+  json += "\"timeSync\":" + String(timeInitialized ? "true" : "false");
+  if (eventCount > 0) {
+    // Show most recent event
+    int idx = (eventIndex - 1 + MAX_EVENTS) % MAX_EVENTS;
+    json += ",\"lastEvent\":{";
+    json += "\"timestamp\":\"" + formatTimestamp(eventLog[idx].timestamp) + "\",";
+    json += "\"mercalli\":" + String(eventLog[idx].mercalli);
+    json += "}";
+  }
   return json;
 }
 
 void handleReset() {
   resetPeakValues();
   server.send(204, "text/plain", ""); // 204 No Content is a good response for a successful action with no reply body
+}
+
+void handleClearEvents() {
+  clearEventLog();
+  server.send(200, "text/plain", "Event log cleared successfully");
 }
